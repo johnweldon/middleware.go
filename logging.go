@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -8,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
+	"strings"
 	"text/template"
 )
 
@@ -26,48 +29,105 @@ const (
 const (
 	minimalRequestTemplateDef  = "  (request) {{.Host}} {{.Method}} {{.URL.Path}}\n"
 	minimalResponseTemplateDef = " (response) {{.Code}} {{ status .Code }}\n"
-	normalRequestTemplateDef   =  minimalRequestTemplateDef + `>>>
+	normalRequestTemplateDef   = "  (request) {{.Host}} {{.Method}} {{.URL.Path}}\n{{ headers .Header }}\n"
+	normalResponseTemplateDef  = " (response) {{.Code}} {{ status .Code }}\n{{ headers .Header }}\n"
+	verboseRequestTemplateDef  = minimalRequestTemplateDef + `---------- BEGIN REQUEST ----------
 {{ dump . }}
-<<<
+----------  END  REQUEST ----------
 `
-	normalResponseTemplateDef =  minimalResponseTemplateDef + `==>
-{{- range $k, $v := .HeaderMap}}
-{{ $k }}: {{ $v }}{{ end }}
-
-{{ .Body.String -}}
-<==
+	verboseResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
+{{ headers .Header }}
+{{ .Body.String }}
+==========  END  RESPONSE ==========
 `
 )
 
 var (
+	details = map[DetailLevel]string{
+		MinimalLevel: "minimal",
+		NormalLevel:  "normal",
+		VerboseLevel: "verbose",
+		DebugLevel:   "debug",
+	}
+	levels = map[string]DetailLevel{
+		"minimal": MinimalLevel,
+		"normal":  NormalLevel,
+		"verbose": VerboseLevel,
+		"debug":   DebugLevel,
+	}
 	requestLevelTemplates = map[DetailLevel]*template.Template{
-		MinimalLevel: parseTemplate(minimalRequestTemplateDef),
-		NormalLevel:  parseTemplate(normalRequestTemplateDef),
+		MinimalLevel: parseTemplate(MinimalLevel, minimalRequestTemplateDef),
+		NormalLevel:  parseTemplate(NormalLevel, normalRequestTemplateDef),
+		VerboseLevel: parseTemplate(VerboseLevel, verboseRequestTemplateDef),
+		DebugLevel:   parseTemplate(DebugLevel, verboseRequestTemplateDef),
 	}
 	responseLevelTemplates = map[DetailLevel]*template.Template{
-		MinimalLevel: parseTemplate(minimalResponseTemplateDef),
-		NormalLevel:  parseTemplate(normalResponseTemplateDef),
+		MinimalLevel: parseTemplate(MinimalLevel, minimalResponseTemplateDef),
+		NormalLevel:  parseTemplate(NormalLevel, normalResponseTemplateDef),
+		VerboseLevel: parseTemplate(VerboseLevel, verboseResponseTemplateDef),
+		DebugLevel:   parseTemplate(DebugLevel, verboseResponseTemplateDef),
+	}
+
+	// RedactedHeaders are the list of headers that are normally redacted
+	RedactedHeaders = []string{"Authorization"}
+	redactHeaders   = map[DetailLevel][]string{
+		MinimalLevel: RedactedHeaders,
+		NormalLevel:  RedactedHeaders,
+		VerboseLevel: RedactedHeaders,
+		DebugLevel:   []string{},
 	}
 )
 
-func parseTemplate(def string) *template.Template {
+// LevelText returns the detail level for the given name
+func LevelText(level string) DetailLevel {
+	if l, ok := levels[strings.ToLower(level)]; ok {
+		return l
+	}
+	return MinimalLevel
+}
+
+func parseTemplate(level DetailLevel, def string) *template.Template {
+	name := details[level]
+	redactedHeaders := func(h http.Header) (orig, redacted http.Header) {
+		orig = h.Clone()
+		for _, k := range redactHeaders[level] {
+			if _, ok := h[k]; ok {
+				h[k] = []string{"[redacted]"}
+			}
+		}
+		redacted = h
+		return
+	}
 	fnMap := map[string]interface{}{
 		"status": http.StatusText,
+		"headers": func(h http.Header) string {
+			var buf bytes.Buffer
+			_, red := redactedHeaders(h)
+			for k, v := range red {
+				fmt.Fprintf(&buf, "%s: %s\n", k, strings.Join(v, ","))
+			}
+			return buf.String()
+		},
 		"dump": func(r *http.Request) string {
+			orig, redacted := redactedHeaders(r.Header)
+			r.Header = redacted
 			b, err := httputil.DumpRequest(r, true)
+			r.Header = orig
 			if err != nil {
 				return err.Error()
 			}
 			return string(b)
 		},
 	}
-	return template.Must(template.New("minimalRequest").Funcs(fnMap).Parse(def))
+	return template.Must(template.New(name).Funcs(fnMap).Parse(def))
 }
 
+// Logger returns a logger configured with the given level and output
 func Logger(level DetailLevel, output io.Writer) *RequestResponseLogger {
 	return &RequestResponseLogger{Level: level, Writer: output}
 }
 
+// MinimalLogger returns a logger configured for minimal detail
 func MinimalLogger(output io.Writer) *RequestResponseLogger { return Logger(MinimalLevel, output) }
 
 // RequestResponseLogger provides detailed HTTP request/response logging.
