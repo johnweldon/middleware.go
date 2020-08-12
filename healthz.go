@@ -2,21 +2,18 @@ package middleware
 
 import "net/http"
 
-// RegisterHealthz registers a very simple Health checker at the
-// `/healthz` endpoint and a debugging endpoint at `/healthz/toggle`
-// that will toggle the health report
-func RegisterHealthz(m *http.ServeMux) {
+// HealthzHandler returns an http.Handler for the // `/healthz` endpoint and a
+// debugging endpoint at `/healthz/toggle` // that will toggle the health report.
+func HealthzHandler() http.Handler {
 	h := &healthz{ok: true}
-	m.HandleFunc("/healthz", h.handleCheck)
-	m.HandleFunc("/healthz/toggle", h.handleToggle)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/toggle", h.handleToggle)
+	mux.HandleFunc("/", h.handleCheck)
+	return mux
 }
 
 type healthz struct {
 	ok bool
-}
-
-func (h *healthz) stop() {
-	h.ok = false
 }
 
 func (h *healthz) handleCheck(w http.ResponseWriter, r *http.Request) {

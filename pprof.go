@@ -6,14 +6,16 @@ import (
 	"net/http/pprof"
 )
 
-// RegisterPprof registers default pprof endpoints at `/debug/pprof/`
-func RegisterPprof(m *http.ServeMux) {
-	m.HandleFunc("/debug/pprof/", pprof.Index)
-	m.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	m.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	m.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	m.HandleFunc("/debug/pprof/trace", pprof.Trace)
+// PprofHandler returns an http.Handler for default pprof endpoints at `/debug/pprof/`.
+func PprofHandler() http.Handler {
+	m := http.NewServeMux()
+	m.HandleFunc("/pprof", pprof.Index)
+	m.HandleFunc("/pprof/cmdline", pprof.Cmdline)
+	m.HandleFunc("/pprof/profile", pprof.Profile)
+	m.HandleFunc("/pprof/symbol", pprof.Symbol)
+	m.HandleFunc("/pprof/trace", pprof.Trace)
 	for _, extra := range []string{"allocs", "block", "goroutine", "heap", "mutex", "threadcreate"} {
-		m.Handle(fmt.Sprintf("/debug/pprof/%s", extra), pprof.Handler(extra))
+		m.Handle(fmt.Sprintf("/pprof/%s", extra), pprof.Handler(extra))
 	}
+	return m
 }

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,10 +15,10 @@ import (
 	"text/template"
 )
 
-// DetailLevel type
+// DetailLevel type.
 type DetailLevel int
 
-// DetailLevel options
+// DetailLevel options.
 const (
 	NoneLevel DetailLevel = iota
 	MinimalLevel
@@ -37,6 +38,11 @@ const (
 `
 	verboseResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
 {{ headers .Header }}
+{{ if statusBad .Result.StatusCode }}{{ .Body.String }}{{ end }}
+==========  END  RESPONSE ==========
+`
+	debugResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
+{{ headers .Header }}
 {{ .Body.String }}
 ==========  END  RESPONSE ==========
 `
@@ -44,46 +50,59 @@ const (
 
 var (
 	details = map[DetailLevel]string{
+		NoneLevel:    "none",
 		MinimalLevel: "minimal",
 		NormalLevel:  "normal",
 		VerboseLevel: "verbose",
 		DebugLevel:   "debug",
 	}
 	levels = map[string]DetailLevel{
+		"none":    NoneLevel,
 		"minimal": MinimalLevel,
 		"normal":  NormalLevel,
 		"verbose": VerboseLevel,
 		"debug":   DebugLevel,
 	}
 	requestLevelTemplates = map[DetailLevel]*template.Template{
+		NoneLevel:    nil,
 		MinimalLevel: parseTemplate(MinimalLevel, minimalRequestTemplateDef),
 		NormalLevel:  parseTemplate(NormalLevel, normalRequestTemplateDef),
 		VerboseLevel: parseTemplate(VerboseLevel, verboseRequestTemplateDef),
 		DebugLevel:   parseTemplate(DebugLevel, verboseRequestTemplateDef),
 	}
 	responseLevelTemplates = map[DetailLevel]*template.Template{
+		NoneLevel:    nil,
 		MinimalLevel: parseTemplate(MinimalLevel, minimalResponseTemplateDef),
 		NormalLevel:  parseTemplate(NormalLevel, normalResponseTemplateDef),
 		VerboseLevel: parseTemplate(VerboseLevel, verboseResponseTemplateDef),
-		DebugLevel:   parseTemplate(DebugLevel, verboseResponseTemplateDef),
+		DebugLevel:   parseTemplate(DebugLevel, debugResponseTemplateDef),
 	}
 
-	// RedactedHeaders are the list of headers that are normally redacted
+	// RedactedHeaders are the list of headers that are normally redacted.
 	RedactedHeaders = []string{"Authorization"}
 	redactHeaders   = map[DetailLevel][]string{
+		NoneLevel:    RedactedHeaders,
 		MinimalLevel: RedactedHeaders,
 		NormalLevel:  RedactedHeaders,
 		VerboseLevel: RedactedHeaders,
-		DebugLevel:   []string{},
+		DebugLevel:   {},
 	}
 )
 
-// LevelText returns the detail level for the given name
-func LevelText(level string) DetailLevel {
+// LevelText returns the detail level for the given name.
+func LevelText(level DetailLevel) string {
+	if l, ok := details[level]; ok {
+		return l
+	}
+	return ""
+}
+
+// TextLevel returns the detail level for the given name.
+func TextLevel(level string) DetailLevel {
 	if l, ok := levels[strings.ToLower(level)]; ok {
 		return l
 	}
-	return MinimalLevel
+	return NoneLevel
 }
 
 func parseTemplate(level DetailLevel, def string) *template.Template {
@@ -118,17 +137,29 @@ func parseTemplate(level DetailLevel, def string) *template.Template {
 			}
 			return string(b)
 		},
+		"statusGood": func(code int) bool { return http.StatusOK <= code && code < http.StatusBadRequest },
+		"statusBad":  func(code int) bool { return http.StatusBadRequest <= code },
 	}
 	return template.Must(template.New(name).Funcs(fnMap).Parse(def))
 }
 
-// Logger returns a logger configured with the given level and output
+// Logger returns a logger configured with the given level and output.
 func Logger(level DetailLevel, output io.Writer) *RequestResponseLogger {
 	return &RequestResponseLogger{Level: level, Writer: output}
 }
 
-// MinimalLogger returns a logger configured for minimal detail
-func MinimalLogger(output io.Writer) *RequestResponseLogger { return Logger(MinimalLevel, output) }
+// MinimalLogger returns a logger configured for minimal detail.
+func MinimalLogger(output io.Writer) *RequestResponseLogger {
+	return Logger(MinimalLevel, output)
+}
+
+// RegisterLevelChanger updates the logging level.
+func (l *RequestResponseLogger) LevelHandler() http.Handler {
+	m := http.NewServeMux()
+	m.HandleFunc("/set", l.handleLevelChange)
+	m.HandleFunc("/", l.handleGetLevel)
+	return m
+}
 
 // RequestResponseLogger provides detailed HTTP request/response logging.
 type RequestResponseLogger struct {
@@ -138,18 +169,72 @@ type RequestResponseLogger struct {
 }
 
 func (l *RequestResponseLogger) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
-	l.Wrap(next).ServeHTTP(w, r)
+	l.Handler(next).ServeHTTP(w, r)
+}
+
+func (l *RequestResponseLogger) handleGetLevel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	res := &struct {
+		Level string `json:"level"`
+	}{Level: LevelText(l.Level)}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (l *RequestResponseLogger) handleLevelChange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	if !hasContentType(r.Header, "application/json") {
+		w.Header().Set("Accept", "application/json")
+		http.Error(w, http.StatusText(http.StatusUnsupportedMediaType), http.StatusUnsupportedMediaType)
+		return
+	}
+	req := &struct {
+		Level string `json:"level"`
+	}{Level: LevelText(l.Level)}
+	defer r.Body.Close()
+	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	newLevel, ok := levels[req.Level]
+	if !ok {
+		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	switch newLevel {
+	case l.Level:
+		w.WriteHeader(http.StatusAlreadyReported)
+		return
+	case NoneLevel, MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
+		l.Level = newLevel
+		w.WriteHeader(http.StatusAccepted)
+		return
+	default:
+		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+		return
+	}
 }
 
 // Wrap inserts the RequestResponseLogger into the middleware chain.
-func (l *RequestResponseLogger) Wrap(h http.Handler) http.Handler {
+func (l *RequestResponseLogger) Handler(h http.Handler) http.Handler {
 	l.initialize()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch l.Level {
 		case NoneLevel:
 			h.ServeHTTP(w, r)
 			return
-		default:
+		case MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
 			l.logRequest(r)
 			rw, logResponse := l.responseLogger(w)
 			defer logResponse()
@@ -159,7 +244,13 @@ func (l *RequestResponseLogger) Wrap(h http.Handler) http.Handler {
 }
 
 func (l *RequestResponseLogger) logRequest(r *http.Request) {
+	if l.Level == NoneLevel {
+		return
+	}
 	if t, ok := requestLevelTemplates[l.Level]; ok {
+		if t == nil {
+			return
+		}
 		if err := t.Execute(l.Writer, r); err != nil {
 			l.Log.Printf("Error executing template %v: %v", l.Level, err)
 		}
@@ -172,6 +263,7 @@ func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.Resp
 	rw := httptest.NewRecorder()
 	return rw, func() {
 		resp := rw.Result()
+		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			l.Log.Fatalf("Error reading body: %v", err)
@@ -184,6 +276,9 @@ func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.Resp
 		w.Write(body)
 
 		if t, ok := responseLevelTemplates[l.Level]; ok {
+			if t == nil {
+				return
+			}
 			if err := t.Execute(l.Writer, rw); err != nil {
 				l.Log.Printf("Error executing template %v: %v", l.Level, err)
 			}
