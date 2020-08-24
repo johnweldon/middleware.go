@@ -24,14 +24,18 @@ func GetRequestID(ctx context.Context) (string, bool) {
 	return id, ok
 }
 
+// NewRequestIDHandler returns a handler that can inject X-Request-ID
+// header, or re-use an existing one.
 func NewRequestIDHandler(generator func() string) *RequestIDHandler {
 	return &RequestIDHandler{generator: generator}
 }
 
+// RequestIDHandler is the handler responsible for X-Request-ID management.
 type RequestIDHandler struct {
 	generator func() string
 }
 
+// Handler implements the middleware interface.
 func (h *RequestIDHandler) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var id string
@@ -39,7 +43,8 @@ func (h *RequestIDHandler) Handler(next http.Handler) http.Handler {
 			id = h.generator()
 			r.Header.Set(xRequestIDKey, id)
 		}
-		w.Header().Set(xRequestIDKey, id)
+		w.Header().Add("Trailer", xRequestIDKey)
+		defer w.Header().Set(xRequestIDKey, id)
 
 		next.ServeHTTP(w, r.WithContext(WithRequestID(r.Context(), id)))
 	})

@@ -29,22 +29,22 @@ const (
 
 // nolint:lll
 const (
-	minimalRequestTemplateDef  = "  (request) {{ with requestid .Header }}[{{ . }}]{{ end }} {{.Host}} {{.Method}} {{.URL.Path}}\n"
-	minimalResponseTemplateDef = " (response) {{ with requestid .Header }}[{{ . }}]{{ end }} {{.Code}} {{ status .Code }}\n"
-	normalRequestTemplateDef   = minimalRequestTemplateDef + "{{ headers .Header }}\n"
-	normalResponseTemplateDef  = minimalResponseTemplateDef + "{{ headers .Header }}\n"
+	minimalRequestTemplateDef  = "  (request) {{ with .requestid }}[{{ . }}] {{ end }}{{ .request.Host }} {{ .request.Method }} {{ .request.URL.Path }}\n"
+	minimalResponseTemplateDef = " (response) {{ with .requestid }}[{{ . }}] {{ end }}{{ .response.Code }} {{ status .response.Code }}\n"
+	normalRequestTemplateDef   = minimalRequestTemplateDef + "{{ headers .request.Header }}\n"
+	normalResponseTemplateDef  = minimalResponseTemplateDef + "{{ headers .response.Header }}\n"
 	verboseRequestTemplateDef  = minimalRequestTemplateDef + `---------- BEGIN REQUEST ----------
-{{ dump . }}
+{{ dump .request }}
 ----------  END  REQUEST ----------
 `
 	verboseResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
-{{ headers .Header }}
-{{ if statusBad .Result.StatusCode }}{{ .Body.String }}{{ end }}
+{{ headers .response.Header }}
+{{ if statusBad .response.Result.StatusCode }}{{ .response.Body.String }}{{ end }}
 ==========  END  RESPONSE ==========
 `
 	debugResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
-{{ headers .Header }}
-{{ .Body.String }}
+{{ headers .response.Header }}
+{{ .response.Body.String }}
 ==========  END  RESPONSE ==========
 `
 )
@@ -166,16 +166,6 @@ func MinimalLogger(output io.Writer) *RequestResponseLogger {
 	return Logger(MinimalLevel, output)
 }
 
-// RegisterLevelChanger updates the logging level.
-func (l *RequestResponseLogger) LevelHandler() http.Handler {
-	m := http.NewServeMux()
-
-	m.HandleFunc("/set", l.handleLevelChange)
-	m.HandleFunc("/", l.handleGetLevel)
-
-	return m
-}
-
 // RequestResponseLogger provides detailed HTTP request/response logging.
 type RequestResponseLogger struct {
 	Writer io.Writer
@@ -186,6 +176,38 @@ type RequestResponseLogger struct {
 // nolint:interfacer
 func (l *RequestResponseLogger) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	l.Handler(next).ServeHTTP(w, r)
+}
+
+// LevelHandler updates the logging level.
+func (l *RequestResponseLogger) LevelHandler() http.Handler {
+	m := http.NewServeMux()
+
+	m.HandleFunc("/set", l.handleLevelChange)
+	m.HandleFunc("/", l.handleGetLevel)
+
+	return m
+}
+
+// Handler inserts the RequestResponseLogger into the middleware chain.
+func (l *RequestResponseLogger) Handler(h http.Handler) http.Handler {
+	l.initialize()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, _ := GetRequestID(r.Context())
+		switch l.Level {
+		case NoneLevel:
+			h.ServeHTTP(w, r)
+
+			return
+		case MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
+			l.logRequest(r, id)
+
+			rw, logResponse := l.responseLogger(w, id)
+			defer logResponse()
+
+			h.ServeHTTP(rw, r)
+		}
+	})
 }
 
 func (l *RequestResponseLogger) handleGetLevel(w http.ResponseWriter, r *http.Request) {
@@ -260,28 +282,7 @@ func (l *RequestResponseLogger) handleLevelChange(w http.ResponseWriter, r *http
 	}
 }
 
-// Wrap inserts the RequestResponseLogger into the middleware chain.
-func (l *RequestResponseLogger) Handler(h http.Handler) http.Handler {
-	l.initialize()
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch l.Level {
-		case NoneLevel:
-			h.ServeHTTP(w, r)
-
-			return
-		case MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
-			l.logRequest(r)
-
-			rw, logResponse := l.responseLogger(w)
-			defer logResponse()
-
-			h.ServeHTTP(rw, r)
-		}
-	})
-}
-
-func (l *RequestResponseLogger) logRequest(r *http.Request) {
+func (l *RequestResponseLogger) logRequest(r *http.Request, id string) {
 	if l.Level == NoneLevel {
 		return
 	}
@@ -291,7 +292,7 @@ func (l *RequestResponseLogger) logRequest(r *http.Request) {
 			return
 		}
 
-		if err := t.Execute(l.Writer, r); err != nil {
+		if err := t.Execute(l.Writer, map[string]interface{}{"request": r, "requestid": id}); err != nil {
 			l.Log.Printf("Error executing template %v: %v", l.Level, err)
 		}
 	} else {
@@ -299,7 +300,7 @@ func (l *RequestResponseLogger) logRequest(r *http.Request) {
 	}
 }
 
-func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.ResponseWriter, func()) {
+func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter, id string) (http.ResponseWriter, func()) {
 	rw := httptest.NewRecorder()
 
 	return rw, func() {
@@ -323,7 +324,7 @@ func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.Resp
 				return
 			}
 
-			if err := t.Execute(l.Writer, rw); err != nil {
+			if err := t.Execute(l.Writer, map[string]interface{}{"response": rw, "requestid": id}); err != nil {
 				l.Log.Printf("Error executing template %v: %v", l.Level, err)
 			}
 		} else {
