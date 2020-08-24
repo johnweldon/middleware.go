@@ -48,6 +48,7 @@ const (
 `
 )
 
+// nolint:gochecknoglobals
 var (
 	details = map[DetailLevel]string{
 		NoneLevel:    "none",
@@ -94,6 +95,7 @@ func LevelText(level DetailLevel) string {
 	if l, ok := details[level]; ok {
 		return l
 	}
+
 	return ""
 }
 
@@ -102,21 +104,27 @@ func TextLevel(level string) DetailLevel {
 	if l, ok := levels[strings.ToLower(level)]; ok {
 		return l
 	}
+
 	return NoneLevel
 }
 
 func parseTemplate(level DetailLevel, def string) *template.Template {
 	name := details[level]
+
 	redactedHeaders := func(h http.Header) (orig, redacted http.Header) {
 		orig = h.Clone()
+
 		for _, k := range redactHeaders[level] {
 			if _, ok := h[k]; ok {
 				h[k] = []string{"[redacted]"}
 			}
 		}
+
 		redacted = h
+
 		return
 	}
+
 	fnMap := map[string]interface{}{
 		"status": http.StatusText,
 		"headers": func(h http.Header) string {
@@ -125,6 +133,7 @@ func parseTemplate(level DetailLevel, def string) *template.Template {
 			for k, v := range red {
 				fmt.Fprintf(&buf, "%s: %s\n", k, strings.Join(v, ","))
 			}
+
 			return buf.String()
 		},
 		"dump": func(r *http.Request) string {
@@ -135,11 +144,13 @@ func parseTemplate(level DetailLevel, def string) *template.Template {
 			if err != nil {
 				return err.Error()
 			}
+
 			return string(b)
 		},
 		"statusGood": func(code int) bool { return http.StatusOK <= code && code < http.StatusBadRequest },
 		"statusBad":  func(code int) bool { return http.StatusBadRequest <= code },
 	}
+
 	return template.Must(template.New(name).Funcs(fnMap).Parse(def))
 }
 
@@ -156,8 +167,10 @@ func MinimalLogger(output io.Writer) *RequestResponseLogger {
 // RegisterLevelChanger updates the logging level.
 func (l *RequestResponseLogger) LevelHandler() http.Handler {
 	m := http.NewServeMux()
+
 	m.HandleFunc("/set", l.handleLevelChange)
 	m.HandleFunc("/", l.handleGetLevel)
+
 	return m
 }
 
@@ -168,6 +181,7 @@ type RequestResponseLogger struct {
 	Level  DetailLevel
 }
 
+// nolint:interfacer
 func (l *RequestResponseLogger) ServeHTTP(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	l.Handler(next).ServeHTTP(w, r)
 }
@@ -176,14 +190,19 @@ func (l *RequestResponseLogger) handleGetLevel(w http.ResponseWriter, r *http.Re
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+
 		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+
 	res := &struct {
 		Level string `json:"level"`
 	}{Level: LevelText(l.Level)}
-	w.Header().Set("Content-Type", "application/json")
+
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
 		return
 	}
 }
@@ -191,37 +210,50 @@ func (l *RequestResponseLogger) handleGetLevel(w http.ResponseWriter, r *http.Re
 func (l *RequestResponseLogger) handleLevelChange(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", http.MethodPut)
-		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+
 		return
 	}
+
 	if !hasContentType(r.Header, "application/json") {
 		w.Header().Set("Accept", "application/json")
 		http.Error(w, http.StatusText(http.StatusUnsupportedMediaType), http.StatusUnsupportedMediaType)
+
 		return
 	}
+
 	req := &struct {
 		Level string `json:"level"`
 	}{Level: LevelText(l.Level)}
+
 	defer r.Body.Close()
+
 	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+
 		return
 	}
+
 	newLevel, ok := levels[req.Level]
 	if !ok {
 		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+
 		return
 	}
+
 	switch newLevel {
 	case l.Level:
 		w.WriteHeader(http.StatusAlreadyReported)
+
 		return
 	case NoneLevel, MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
 		l.Level = newLevel
+
 		w.WriteHeader(http.StatusAccepted)
+
 		return
 	default:
 		http.Error(w, `expect JSON body like: {"level":"none|minimal|normal|verbose|debug"}`, http.StatusUnprocessableEntity)
+
 		return
 	}
 }
@@ -229,15 +261,19 @@ func (l *RequestResponseLogger) handleLevelChange(w http.ResponseWriter, r *http
 // Wrap inserts the RequestResponseLogger into the middleware chain.
 func (l *RequestResponseLogger) Handler(h http.Handler) http.Handler {
 	l.initialize()
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch l.Level {
 		case NoneLevel:
 			h.ServeHTTP(w, r)
+
 			return
 		case MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
 			l.logRequest(r)
+
 			rw, logResponse := l.responseLogger(w)
 			defer logResponse()
+
 			h.ServeHTTP(rw, r)
 		}
 	})
@@ -247,10 +283,12 @@ func (l *RequestResponseLogger) logRequest(r *http.Request) {
 	if l.Level == NoneLevel {
 		return
 	}
+
 	if t, ok := requestLevelTemplates[l.Level]; ok {
 		if t == nil {
 			return
 		}
+
 		if err := t.Execute(l.Writer, r); err != nil {
 			l.Log.Printf("Error executing template %v: %v", l.Level, err)
 		}
@@ -261,9 +299,11 @@ func (l *RequestResponseLogger) logRequest(r *http.Request) {
 
 func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.ResponseWriter, func()) {
 	rw := httptest.NewRecorder()
+
 	return rw, func() {
 		resp := rw.Result()
 		defer resp.Body.Close()
+
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			l.Log.Fatalf("Error reading body: %v", err)
@@ -272,13 +312,15 @@ func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter) (http.Resp
 		for k, v := range resp.Header {
 			w.Header()[k] = v
 		}
+
 		w.WriteHeader(rw.Code)
-		w.Write(body)
+		w.Write(body) // nolint:errcheck
 
 		if t, ok := responseLevelTemplates[l.Level]; ok {
 			if t == nil {
 				return
 			}
+
 			if err := t.Execute(l.Writer, rw); err != nil {
 				l.Log.Printf("Error executing template %v: %v", l.Level, err)
 			}
@@ -292,6 +334,7 @@ func (l *RequestResponseLogger) initialize() {
 	if l.Writer == nil {
 		l.Writer = os.Stdout
 	}
+
 	if l.Log == nil {
 		l.Log = log.New(l.Writer, " [RW] ", log.LstdFlags)
 	}
