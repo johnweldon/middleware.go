@@ -27,11 +27,12 @@ const (
 	DebugLevel
 )
 
+// nolint:lll
 const (
-	minimalRequestTemplateDef  = "  (request) {{.Host}} {{.Method}} {{.URL.Path}}\n"
-	minimalResponseTemplateDef = " (response) {{.Code}} {{ status .Code }}\n"
-	normalRequestTemplateDef   = "  (request) {{.Host}} {{.Method}} {{.URL.Path}}\n{{ headers .Header }}\n"
-	normalResponseTemplateDef  = " (response) {{.Code}} {{ status .Code }}\n{{ headers .Header }}\n"
+	minimalRequestTemplateDef  = "  (request) {{ with requestid .Header }}[{{ . }}]{{ end }} {{.Host}} {{.Method}} {{.URL.Path}}\n"
+	minimalResponseTemplateDef = " (response) {{ with requestid .Header }}[{{ . }}]{{ end }} {{.Code}} {{ status .Code }}\n"
+	normalRequestTemplateDef   = minimalRequestTemplateDef + "{{ headers .Header }}\n"
+	normalResponseTemplateDef  = minimalResponseTemplateDef + "{{ headers .Header }}\n"
 	verboseRequestTemplateDef  = minimalRequestTemplateDef + `---------- BEGIN REQUEST ----------
 {{ dump . }}
 ----------  END  REQUEST ----------
@@ -136,6 +137,7 @@ func parseTemplate(level DetailLevel, def string) *template.Template {
 
 			return buf.String()
 		},
+		"requestid": func(h http.Header) string { return h.Get(xRequestIDKey) },
 		"dump": func(r *http.Request) string {
 			orig, redacted := redactedHeaders(r.Header)
 			r.Header = redacted

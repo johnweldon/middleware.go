@@ -39,6 +39,7 @@ func (h *RequestIDHandler) Handler(next http.Handler) http.Handler {
 			id = h.generator()
 			r.Header.Set(xRequestIDKey, id)
 		}
+		w.Header().Set(xRequestIDKey, id)
 
 		next.ServeHTTP(w, r.WithContext(WithRequestID(r.Context(), id)))
 	})
