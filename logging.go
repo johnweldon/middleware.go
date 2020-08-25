@@ -81,7 +81,7 @@ var (
 	}
 
 	// RedactedHeaders are the list of headers that are normally redacted.
-	RedactedHeaders = []string{"Authorization", "Cookie"}
+	RedactedHeaders = []string{"Authorization", "Cookie", "Set-Cookie"}
 	redactHeaders   = map[DetailLevel][]string{
 		NoneLevel:    RedactedHeaders,
 		MinimalLevel: RedactedHeaders,
@@ -326,11 +326,13 @@ func NewRoundTripLogger(inner http.RoundTripper, level DetailLevel, out io.Write
 	return l
 }
 
+// RoundTripLogger is an http.RoundTripper that logs the requests and responses.
 type RoundTripLogger struct {
 	coreLogger
 	inner http.RoundTripper
 }
 
+// RoundTrip fulfills the http.RoundTripper interface.
 func (l *RoundTripLogger) RoundTrip(r *http.Request) (*http.Response, error) {
 	id, _ := GetRequestID(r.Context())
 
