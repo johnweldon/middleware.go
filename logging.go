@@ -30,7 +30,7 @@ const (
 // nolint:lll
 const (
 	minimalRequestTemplateDef  = "  (request) {{ with .requestid }}[{{ . }}] {{ end }}{{ .request.Host }} {{ .request.Method }} {{ .request.URL.Path }}\n"
-	minimalResponseTemplateDef = " (response) {{ with .requestid }}[{{ . }}] {{ end }}{{ .response.Code }} {{ status .response.Code }}\n"
+	minimalResponseTemplateDef = " (response) {{ with .requestid }}[{{ . }}] {{ end }}{{ .response.StatusCode }} {{ status .response.StatusCode }}\n"
 	normalRequestTemplateDef   = minimalRequestTemplateDef + "{{ headers .request.Header }}\n"
 	normalResponseTemplateDef  = minimalResponseTemplateDef + "{{ headers .response.Header }}\n"
 	verboseRequestTemplateDef  = minimalRequestTemplateDef + `---------- BEGIN REQUEST ----------
@@ -39,12 +39,12 @@ const (
 `
 	verboseResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
 {{ headers .response.Header }}
-{{ if statusBad .response.Result.StatusCode }}{{ .response.Body.String }}{{ end }}
+{{ if statusBad .response.StatusCode }}{{ .body }}{{ end }}
 ==========  END  RESPONSE ==========
 `
 	debugResponseTemplateDef = minimalResponseTemplateDef + `========== BEGIN RESPONSE ==========
 {{ headers .response.Header }}
-{{ .response.Body.String }}
+{{ .body }}
 ==========  END  RESPONSE ==========
 `
 )
@@ -81,7 +81,7 @@ var (
 	}
 
 	// RedactedHeaders are the list of headers that are normally redacted.
-	RedactedHeaders = []string{"Authorization"}
+	RedactedHeaders = []string{"Authorization", "Cookie"}
 	redactHeaders   = map[DetailLevel][]string{
 		NoneLevel:    RedactedHeaders,
 		MinimalLevel: RedactedHeaders,
@@ -158,7 +158,7 @@ func parseTemplate(level DetailLevel, def string) *template.Template {
 
 // Logger returns a logger configured with the given level and output.
 func Logger(level DetailLevel, output io.Writer) *RequestResponseLogger {
-	return &RequestResponseLogger{Level: level, Writer: output}
+	return &RequestResponseLogger{coreLogger{Level: level, Writer: output}}
 }
 
 // MinimalLogger returns a logger configured for minimal detail.
@@ -168,9 +168,7 @@ func MinimalLogger(output io.Writer) *RequestResponseLogger {
 
 // RequestResponseLogger provides detailed HTTP request/response logging.
 type RequestResponseLogger struct {
-	Writer io.Writer
-	Log    *log.Logger
-	Level  DetailLevel
+	coreLogger
 }
 
 // nolint:interfacer
@@ -200,7 +198,7 @@ func (l *RequestResponseLogger) Handler(h http.Handler) http.Handler {
 
 			return
 		case MinimalLevel, NormalLevel, VerboseLevel, DebugLevel:
-			l.logRequest(r, id)
+			r := l.logRequest(r, id)
 
 			rw, logResponse := l.responseLogger(w, id)
 			defer logResponse()
@@ -282,35 +280,23 @@ func (l *RequestResponseLogger) handleLevelChange(w http.ResponseWriter, r *http
 	}
 }
 
-func (l *RequestResponseLogger) logRequest(r *http.Request, id string) {
-	if l.Level == NoneLevel {
-		return
-	}
-
-	if t, ok := requestLevelTemplates[l.Level]; ok {
-		if t == nil {
-			return
-		}
-
-		if err := t.Execute(l.Writer, map[string]interface{}{"request": r, "requestid": id}); err != nil {
-			l.Log.Printf("Error executing template %v: %v", l.Level, err)
-		}
-	} else {
-		l.Log.Fatalf("Missing template for %v", l.Level)
-	}
-}
-
 func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter, id string) (http.ResponseWriter, func()) {
 	rw := httptest.NewRecorder()
 
 	return rw, func() {
 		resp := rw.Result()
-		defer resp.Body.Close()
 
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			l.Log.Fatalf("Error reading body: %v", err)
+			l.Log.Printf("Error reading body: %v", err)
 		}
+
+		if err = resp.Body.Close(); err != nil {
+			l.Log.Printf("Error closing body: %v", err)
+		}
+
+		resp.Body = ioutil.NopCloser(bytes.NewReader(body))
+		defer resp.Body.Close()
 
 		for k, v := range resp.Header {
 			w.Header()[k] = v
@@ -319,26 +305,148 @@ func (l *RequestResponseLogger) responseLogger(w http.ResponseWriter, id string)
 		w.WriteHeader(rw.Code)
 		w.Write(body) // nolint:errcheck
 
-		if t, ok := responseLevelTemplates[l.Level]; ok {
-			if t == nil {
-				return
-			}
-
-			if err := t.Execute(l.Writer, map[string]interface{}{"response": rw, "requestid": id}); err != nil {
-				l.Log.Printf("Error executing template %v: %v", l.Level, err)
-			}
-		} else {
-			l.Log.Fatalf("Missing template for %v", l.Level)
-		}
+		// nolint:bodyclose
+		l.logResponse(rw.Result(), id)
 	}
 }
 
-func (l *RequestResponseLogger) initialize() {
-	if l.Writer == nil {
-		l.Writer = os.Stdout
+// NewRoundTripLogger returns an http.RoundTripper that logs requests and responses.
+// nolint:lll
+func NewRoundTripLogger(inner http.RoundTripper, level DetailLevel, out io.Writer, logger *log.Logger) *RoundTripLogger {
+	l := &RoundTripLogger{
+		coreLogger: coreLogger{
+			Level:  level,
+			Log:    logger,
+			Writer: out,
+		},
+		inner: inner,
+	}
+	l.initialize()
+
+	return l
+}
+
+type RoundTripLogger struct {
+	coreLogger
+	inner http.RoundTripper
+}
+
+func (l *RoundTripLogger) RoundTrip(r *http.Request) (*http.Response, error) {
+	id, _ := GetRequestID(r.Context())
+
+	l.logRequest(r, id)
+
+	resp, err := l.inner.RoundTrip(r)
+	if err != nil {
+		return nil, err
 	}
 
+	l.logResponse(resp, id)
+
+	return resp, nil
+}
+
+type coreLogger struct {
+	Level  DetailLevel
+	Log    *log.Logger
+	Writer io.Writer
+}
+
+func (l *coreLogger) logRequest(r *http.Request, id string) *http.Request {
+	if l.Level == NoneLevel {
+		return r
+	}
+
+	t, ok := requestLevelTemplates[l.Level]
+	if !ok {
+		l.Log.Printf("Error missing request template for %v", l.Level)
+
+		return r
+	}
+
+	if t == nil {
+		return r
+	}
+
+	var (
+		err  error
+		body = []byte("<nil>")
+	)
+
+	if r.Body != nil {
+		body, err = ioutil.ReadAll(r.Body)
+		if err != nil {
+			l.Log.Printf("Error reading body: %v", err)
+
+			return r
+		}
+
+		if err = r.Body.Close(); err != nil {
+			l.Log.Printf("Error closing body: %v", err)
+
+			return r
+		}
+
+		r.Body = ioutil.NopCloser(bytes.NewReader(body))
+	}
+
+	data := map[string]interface{}{
+		"request":   r,
+		"requestid": id,
+		"body":      body,
+	}
+
+	if err := t.Execute(l.Writer, data); err != nil {
+		l.Log.Printf("Error executing template %v: %v", l.Level, err)
+	}
+
+	return r
+}
+
+func (l *coreLogger) logResponse(r *http.Response, id string) {
+	t, ok := responseLevelTemplates[l.Level]
+	if !ok {
+		l.Log.Printf("Error missing response template for %v", l.Level)
+
+		return
+	}
+
+	if t == nil {
+		return
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		l.Log.Printf("Error reading body: %v", err)
+
+		return
+	}
+
+	if err = r.Body.Close(); err != nil {
+		l.Log.Printf("Error closing body: %v", err)
+
+		return
+	}
+
+	data := map[string]interface{}{
+		"response":  r,
+		"requestid": id,
+		"body":      string(body),
+	}
+
+	if err := t.Execute(l.Writer, data); err != nil {
+		l.Log.Printf("Error executing template %v: %v", l.Level, err)
+	}
+
+	r.Body = ioutil.NopCloser(bytes.NewReader(body))
+}
+
+func (l *coreLogger) initialize() {
 	if l.Log == nil {
-		l.Log = log.New(l.Writer, " [RW] ", log.LstdFlags)
+		l.Log = log.New(l.Writer, " [request/response logger] ", log.LstdFlags)
+	}
+
+	if l.Writer == nil {
+		l.Writer = os.Stdout
 	}
 }
